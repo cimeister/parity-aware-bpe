@@ -1,8 +1,16 @@
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+<p align="center">
+  <a href="https://arxiv.org/abs/2508.04796">
+    <img alt="arXiv" src="https://img.shields.io/badge/arXiv-Paper-red">
+  </a>
+  <a href="https://opensource.org/licenses/MIT">
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-green.svg">
+  </a>
+</p>
 
 Parity-Aware Byte-Pair Encoding: Improving Cross-lingual Fairness in Tokenization
 ================================== 
 This repository provides an implementation of the **Parity-Aware BPE** algorithm.
+Paper: ["Parity-Aware Byte-Pair Encoding: Improving Cross-lingual Fairness in Tokenization"](https://arxiv.org/abs/2508.04796) [arXiv 2025]
 
 
 Overview
