@@ -76,6 +76,9 @@ def create_parser(subparsers=None):
         metavar='PATHS',
         help="Development texts (are used for parity computation).")
     parser.add_argument(
+        '--ratio', '-r', type=float, nargs='*',
+        help="Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.")
+    parser.add_argument(
         '--output', '-o', type=argparse.FileType('w'), default=sys.stdout,
         metavar='PATH',
         help="Output file for BPE codes (default: standard output)")
@@ -465,10 +468,13 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
     for l in range(array_length):
         threshold[l] = stats[max(stats, key=lambda x: (stats[x][l], x))][l] / 10
 
-    lengths = functools.reduce(numpy.add, [len(key)*value for key, value in dev_vocab.items()])
+    if dev_vocab:
+        lengths = functools.reduce(numpy.add, [len(key)*value for key, value in dev_vocab.items()])
+    else:
+        lengths = None
     return (dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length)
 
-def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, num_workers=1):
+def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1):
     """
     Learn `num_symbols` merge operations using Parity-aware BPE from the provided training and development files
     and write the learned BPE operations to `outfile`.
@@ -492,6 +498,8 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
             If True, subtract number of characters from the symbols to be generated (so that 'num_symbols' becomes an estimate for the total number of symbols needed to encode text). Defaults to False.
         num_global (int, optional): 
             Number of initial merges to perform globally across all corpora before handling them separately. Defaults to 0.
+        ratio (list[float[):
+            Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
 
@@ -508,6 +516,10 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
     dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers)
 
+    if not ratio is None:
+        initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
+        lengths = numpy.copy(initial_lengths)
+
     for i in tqdm(range(num_symbols), desc="parity-aware BPE..."):
         if stats:
             if i < num_global:
@@ -516,9 +528,19 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
                 max_index = -1
 
             else:
-                max_index, max_value = max(enumerate(lengths), key=operator.itemgetter(1))
-                if verbose:
-                    sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
+                if not ratio is None:
+                    # we want to find the language with the least compression, adjusted by the user_defined desired ratio
+                    compression_rates = initial_lengths/lengths
+                    adjusted_compression_rates = compression_rates/ratio
+                    max_index, max_value = min(enumerate(adjusted_compression_rates), key=operator.itemgetter(1))
+                    if verbose:
+                        sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
+                        sys.stderr.write('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2} \n'.format(compression_rates, adjusted_compression_rates, max_index))
+
+                else:
+                    max_index, max_value = max(enumerate(lengths), key=operator.itemgetter(1))
+                    if verbose:
+                        sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
 
             most_frequent = max(stats, key=lambda x: (stats[x][max_index], x))
 
@@ -544,8 +566,13 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
         outfile.write('{0} {1}\n'.format(*most_frequent))
         
         changes = replace_pair(most_frequent, sorted_vocab, indices)
-        length_change = replace_pair_dict(most_frequent, dev_vocab)
-        lengths -= length_change
+
+        if not ratio is None:
+            length_change = functools.reduce(numpy.add, [(len(c[2])-len(c[1]))*c[3] for c in changes])
+            lengths -= length_change
+        else:
+            length_change = replace_pair_dict(most_frequent, dev_vocab)
+            lengths -= length_change
 
         update_pair_statistics(most_frequent, changes, stats, indices)
         
@@ -588,7 +615,7 @@ def select_language_index(lengths, selected_indices, selection_threshold, window
 
     return final_index
 
-def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size=100, alpha=2, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, num_workers=1):
+def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size=100, alpha=2, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1):
     """
     Learn `num_symbols` merge operations using Parity-aware BPE (moving-window balancing variant) from the provided training and development files
     and write the learned BPE operations to `outfile`.
@@ -616,6 +643,8 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
             If True, subtract number of characters from the symbols to be generated (so that 'num_symbols' becomes an estimate for the total number of symbols needed to encode text). Defaults to False.
         num_global (int, optional): 
             Number of initial merges to perform globally across all corpora before handling them separately. Defaults to 0.
+        ratio (list[float[):
+            Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
 
@@ -632,7 +661,11 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
     outfile.write('#version: 0.2\n')
     dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers)
-    
+
+    if not ratio is None:
+        initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
+        lengths = numpy.copy(initial_lengths)
+
     selection_threshold = alpha * 1.0 / len(threshold)
     selected_indices = deque(maxlen=window_size)
 
@@ -644,10 +677,24 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
                 max_index = -1
 
             else:
-                max_index = select_language_index(lengths, selected_indices, selection_threshold, window_size)
-                selected_indices.append(max_index)
-                if verbose:
-                    sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
+                if not ratio is None:
+                    # we want to find the language with the least compression, adjusted by the user_defined desired ratio
+                    compression_rates = initial_lengths/lengths
+                    adjusted_compression_rates = compression_rates/ratio
+                    # if verbose:
+                        # sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
+                        # sys.stderr.write('compression rates {0}\nadjusted compression rates {1}\n'.format(compression_rates, adjusted_compression_rates))
+                    max_index = select_language_index(-adjusted_compression_rates, selected_indices, selection_threshold, window_size)
+                    selected_indices.append(max_index)
+                    if verbose:
+                        sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
+                        sys.stderr.write('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2} \n'.format(compression_rates, adjusted_compression_rates, max_index))
+
+                else:
+                    max_index = select_language_index(lengths, selected_indices, selection_threshold, window_size)
+                    selected_indices.append(max_index)
+                    if verbose:
+                        sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
 
             most_frequent = max(stats, key=lambda x: (stats[x][max_index], x))
 
@@ -673,8 +720,13 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
         outfile.write('{0} {1}\n'.format(*most_frequent))
         
         changes = replace_pair(most_frequent, sorted_vocab, indices)
-        length_change = replace_pair_dict(most_frequent, dev_vocab)
-        lengths -= length_change
+
+        if not ratio is None:
+            length_change = functools.reduce(numpy.add, [(len(c[2])-len(c[1]))*c[3] for c in changes])
+            lengths -= length_change
+        else:
+            length_change = replace_pair_dict(most_frequent, dev_vocab)
+            lengths -= length_change
 
         update_pair_statistics(most_frequent, changes, stats, indices)
         
@@ -712,19 +764,31 @@ if __name__ == '__main__':
     if args.dev:
         assert(len(args.input) == len(args.dev))
 
+    if args.ratio:
+        assert(args.dev is None)
+        assert(len(args.input) == len(args.ratio))
+        args.ratio = numpy.array(args.ratio)
+        #normalize ratios by first value given
+        args.ratio = args.ratio/args.ratio[0]
+
+    if args.dev is None and args.ratio is None:
+        print("script requires either dev sets or ratios")
+        sys.exit(1)
+
     # read/write files as UTF-8
     for i,f in enumerate(args.input):
         if f.name != '<stdin>':
             args.input[i] = codecs.open(f.name, encoding='utf-8')
-    for i,f in enumerate(args.dev):
-        args.dev[i] = codecs.open(f.name, encoding='utf-8')
+    if args.dev:
+        for i,f in enumerate(args.dev):
+            args.dev[i] = codecs.open(f.name, encoding='utf-8')
     if args.output.name != '<stdout>':
         args.output = codecs.open(args.output.name, 'w', encoding='utf-8')
 
     if args.variant == 'base':
-        learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, num_workers=args.num_workers)
+        learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers)
     elif args.variant == 'window':
-        learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, num_workers=args.num_workers)
+        learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers)
     else:
         raise ValueError("Unknown BPE variant: {0}. Use 'base' or 'window'.".format(args.variant))
 

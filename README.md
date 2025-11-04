@@ -47,6 +47,7 @@ The arguments of `parity-aware-bpe` are as follows:
     - window – moving-window balancing version 
 - `--input`: Space-separated list of training corpora (one per language).
 - `--dev`: Space-separated list of development texts used for parity computation (multi-parallel). The tool assumes that the language of the nth input corpus corresponds to the nth dev corpus (same order as `--input`).
+- `--ratio`: Space-separated list of desired compression ratios (floats), relative to pre-tokenized training set length, per input language. Can be used for parity computation (on training data) in lieu of development set.
 - `--global-merges`: Optionally, one can perform the first M merge operations based on global frequency statistics (equivalent to standard BPE), and only switch to a parity-optimizing mode after (Hybrid parity-aware BPE). This argument controls how many merge operations are performed based on global statistics.
 - `--symbols`: Total number of BPE merges to perform.
 - `--output`: Path to the output file where BPE merge rules will be saved (one per line).
