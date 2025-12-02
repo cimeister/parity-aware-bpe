@@ -43,7 +43,7 @@ logger.addHandler(ch)
 
 from tokenizers.pre_tokenizers import Whitespace, ByteLevel
 from tokenizers import pre_tokenizers
-pre_tokenizer = pre_tokenizers.Sequence([Whitespace(), ByteLevel(use_regex=False)])
+
 
 
 try:
@@ -91,6 +91,15 @@ def create_parser(subparsers=None):
     parser.add_argument(
         '--min-frequency', type=int, default=2, metavar='FREQ',
         help='Stop if no symbol pair has frequency >= FREQ (default: %(default)s)')
+    parser.add_argument(
+        '--preload', type=argparse.FileType('r'), default=None,
+        metavar='PATH',
+        help="Preload merges from BPE file (default: None). Can be used to continue learning with different settings (e.g. without whitespace pre-tokenization for SuperBPE).")
+    parser.add_argument(
+        '--pretokenize', type=str, default=['whitespace', 'bytelevel'], nargs='*',
+        # metavar='STR',
+        choices=['whitespace', 'bytelevel'],
+        help="Huggingface pre-tokenizer(s) to apply. (default: %(default)s)")
     parser.add_argument('--dict-input', action="store_true",
         help="If set, input file is interpreted as a dictionary where each line contains a word-count pair")
     parser.add_argument(
@@ -199,6 +208,51 @@ def _get_vocabulary(infile, outfile, begin, end):
             line = f.readline()
     with open(outfile, 'w') as f:
         pickle.dump(vocab, f)
+
+def pre_merge(vocab, bpe_codes):
+    """Apply list of BPE merge operations to each item in vocab
+    """
+
+    new_vocab = Counter()
+
+    for orig in vocab:
+
+        if len(orig) == 1:
+            new_vocab[orig] = vocab[orig]
+
+        word = list(orig[:-1]) + [orig[-1]]
+
+        while len(word) > 1:
+
+            # get list of symbol pairs; optionally apply dropout
+            pairs = [(bpe_codes[pair],i,pair) for (i,pair) in enumerate(zip(word, word[1:])) if pair in bpe_codes]
+
+            if not pairs:
+                break
+
+            #get first merge operation in list of BPE codes
+            bigram = min(pairs)[2]
+
+            # find start position of all pairs that we want to merge
+            positions = [i for (rank,i,pair) in pairs if pair == bigram]
+
+            i = 0
+            new_word = []
+            bigram = ''.join(bigram)
+            for j in positions:
+                # merges are invalid if they start before current position. This can happen if there are overlapping pairs: (x x x -> xx x)
+                if j < i:
+                    continue
+                new_word.extend(word[i:j]) # all symbols before merged pair
+                new_word.append(bigram) # merged pair
+                i = j+2 # continue after merged pair
+            new_word.extend(word[i:]) # add all symbols until end of word
+            word = new_word
+
+        word = tuple(word)
+        new_vocab[word] = vocab[orig]
+
+    return new_vocab
 
 def update_pair_statistics(pair, changed, stats, indices):
     """ Minimally updates the indices and frequency of symbol pairs.
@@ -387,7 +441,7 @@ def open_file(filename, mode):
         f.close()
 
 
-def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False, num_global=0, num_workers=1):
+def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False, num_global=0, num_workers=1, bpe_file=None):
     """ Reads input files and creates vocabulary data structure.
     Args:
         infiles (list[str]): A list of input file paths.
@@ -396,6 +450,7 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         total_symbols (bool): Whether to count total symbols.
         num_global (int): The number of global symbols.
         num_workers (int): The number of worker threads to use.
+        bpe_file (fobj): file containing merge operations to pre-apply before learning
     Returns:
         tuple: A tuple containing:
             - dev_vocab (defaultdict): A dictionary mapping subwords to their frequencies in the development set.
@@ -408,10 +463,34 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
             - array_length (int): The length of the vocabulary array, which is the number of languages plus one for concatenation.
     """
 
+    if not bpe_file is None:
+        
+        # ignore first line containing version information (if it exists)
+        line = bpe_file.readline()
+        offset = 1
+        if not line.startswith('version'):
+            bpe_file.seek(0)
+            offset = 0
+        
+        bpe_codes = [tuple(item.strip('\r\n ').split(' ')) for (n, item) in enumerate(bpe_file.read().rstrip('\n').split('\n'))]
+
+        for i, item in enumerate(bpe_codes):
+            if len(item) != 2:
+                sys.stderr.write('Error: invalid line {0} in BPE codes file: {1}\n'.format(i+offset, ' '.join(item)))
+                sys.stderr.write('The line should exist of exactly two subword units, separated by whitespace\n')
+                sys.exit(1)
+
+        # some hacking to deal with duplicates (only consider first instance)
+        bpe_codes = dict([(code,i) for (i,code) in reversed(list(enumerate(bpe_codes)))])
+    else:
+        bpe_codes = None
+
     vocabs = []
     joint_keys = set()
     for f in infiles:
         vocab = get_vocabulary(f, is_dict, num_workers)
+        if not bpe_codes is None:
+            vocab = pre_merge(vocab, bpe_codes)
         vocab = dict([(tuple(x,) ,y) for (x,y) in vocab.items()])
         vocabs.append(vocab)
         joint_keys = joint_keys.union(vocab.keys())
@@ -421,6 +500,8 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
     if devfiles:
         for f in devfiles:
             vocab = get_vocabulary(f, is_dict, num_workers)
+            if not bpe_codes is None:
+                vocab = pre_merge(vocab, bpe_codes)
             vocab = dict([(tuple(x,) ,y) for (x,y) in vocab.items()])
             
             dev_vocabs.append(vocab)
@@ -474,7 +555,7 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         lengths = None
     return (dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length)
 
-def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1):
+def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1, bpe_file=None):
     """
     Learn `num_symbols` merge operations using Parity-aware BPE from the provided training and development files
     and write the learned BPE operations to `outfile`.
@@ -502,6 +583,8 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
             Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
+        bpe_file (file-like, optional):
+            Path to file from which to pre-load BPE merges (to continue learning with different settings, e.g. for SuperBPE).
 
     Returns:
         None
@@ -514,7 +597,7 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
     # version numbering allows bckward compatibility
     outfile.write('#version: 0.2\n')
     dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
-        preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers)
+        preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
     if not ratio is None:
         initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
@@ -615,7 +698,7 @@ def select_language_index(lengths, selected_indices, selection_threshold, window
 
     return final_index
 
-def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size=100, alpha=2, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1):
+def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size=100, alpha=2, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1, bpe_file=None):
     """
     Learn `num_symbols` merge operations using Parity-aware BPE (moving-window balancing variant) from the provided training and development files
     and write the learned BPE operations to `outfile`.
@@ -647,6 +730,8 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
             Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
+        bpe_file (file-like, optional):
+            Path to file from which to pre-load BPE merges (to continue learning with different settings, e.g. for SuperBPE).
 
     Returns:
         None
@@ -658,9 +743,10 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
               num_symbols, min_frequency, verbose, is_dict, total_symbols, num_global, num_workers))
     
     # version numbering allows bckward compatibility
-    outfile.write('#version: 0.2\n')
+    if bpe_file is None:
+        outfile.write('#version: 0.2\n')
     dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
-        preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers)
+        preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
     if not ratio is None:
         initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
@@ -784,11 +870,27 @@ if __name__ == '__main__':
             args.dev[i] = codecs.open(f.name, encoding='utf-8')
     if args.output.name != '<stdout>':
         args.output = codecs.open(args.output.name, 'w', encoding='utf-8')
+    if args.preload is None:
+        bpe_file = None
+    else:
+        bpe_file = codecs.open(args.preload.name, encoding='utf-8')
+
+
+    pretokenizer_list = []
+    for pretokenizer in args.pretokenize:
+        if pretokenizer == 'whitespace':
+            pretokenizer_list.append(Whitespace())
+        elif pretokenizer == 'bytelevel':
+            pretokenizer_list.append(ByteLevel(use_regex=False))
+        else:
+            raise ValueError("pretokenizer {0} is not implemented".format(pretokenizer))
+
+    pre_tokenizer = pre_tokenizers.Sequence(pretokenizer_list)
 
     if args.variant == 'base':
-        learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers)
+        learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
     elif args.variant == 'window':
-        learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers)
+        learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
     else:
         raise ValueError("Unknown BPE variant: {0}. Use 'base' or 'window'.".format(args.variant))
 
